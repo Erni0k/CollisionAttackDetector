@@ -13,6 +13,16 @@ from pathlib import Path
 
 CHUNK_SIZE = 1024 * 1024
 MAX_DIFFERENCE_RANGES = 20
+SUPPORTED_ALGORITHMS = tuple(sorted(hashlib.algorithms_guaranteed - {"shake_128", "shake_256"}))
+
+
+def normalize_algorithms(algorithms):
+    if isinstance(algorithms, str):
+        algorithms = algorithms.split(",")
+    selected = list(dict.fromkeys(name.strip().lower() for name in algorithms))
+    if not selected or any(name not in SUPPORTED_ALGORITHMS for name in selected):
+        raise ValueError("Choose one or more algorithms from: " + ", ".join(SUPPORTED_ALGORITHMS))
+    return selected
 
 
 def signature(info):
@@ -31,18 +41,26 @@ def check_unchanged(stream, record):
 
 
 def hash_file(path, algorithm):
+    digests, record = hash_file_many(path, [algorithm])
+    return digests[algorithm.strip().lower()], record
+
+
+def hash_file_many(path, algorithms):
+    """Compute all selected hashes during a single streaming read."""
+    algorithms = normalize_algorithms(algorithms)
+    hashers = {name: hashlib.new(name, usedforsecurity=False) for name in algorithms}
     # Reject directories, devices, and named pipes before opening them.
     info = path.stat()
     if not stat.S_ISREG(info.st_mode):
         raise OSError("Expected a regular file")
     record = FileRecord(path, signature(info))
-    digest = hashlib.new(algorithm, usedforsecurity=False)
     with path.open("rb") as stream:
         check_unchanged(stream, record)
         for chunk in iter(lambda: stream.read(CHUNK_SIZE), b""):
-            digest.update(chunk)
+            for digest in hashers.values():
+                digest.update(chunk)
         check_unchanged(stream, record)
-    return digest.hexdigest(), record
+    return {name: digest.hexdigest() for name, digest in hashers.items()}, record
 
 
 def compare_files(left, right):
@@ -101,36 +119,52 @@ def identical(left, right):
 
 
 def scan(paths, algorithm="sha256"):
+    algorithms = normalize_algorithms(algorithm)
     report = {
-        "algorithm": algorithm,
+        # Retain the original field for consumers of single-algorithm reports.
+        "algorithm": algorithms[0] if len(algorithms) == 1 else None,
+        "algorithms": algorithms,
         "files_scanned": 0,
         "collisions": [],
         "duplicates": [],
         "errors": [],
     }
-    seen = {}
+    seen = {name: {} for name in algorithms}
     for value in paths:
         path = Path(value)
         try:
-            digest, record = hash_file(path, algorithm)
-            group = seen.setdefault(digest, [])
-            first_differences = None
-            for index, previous in enumerate(group):
-                differences = compare_files(previous, record)
-                if index == 0:
-                    first_differences = differences
-                if differences["different_bytes"] == 0:
-                    report["duplicates"].append({
-                        "files": [str(previous.path), str(path)], "digest": digest,
-                    })
-                    break
-            else:
-                if group:
-                    report["collisions"].append({
-                        "files": [str(group[0].path), str(path)], "digest": digest,
-                        "differences": first_differences,
-                    })
-                group.append(record)
+            digests, record = hash_file_many(path, algorithms)
+            comparisons = {}
+            pending_events = []
+            pending_groups = []
+            for name, digest in digests.items():
+                group = seen[name].get(digest, [])
+                first_differences = None
+                for index, previous in enumerate(group):
+                    if previous not in comparisons:
+                        comparisons[previous] = compare_files(previous, record)
+                    differences = comparisons[previous]
+                    if index == 0:
+                        first_differences = differences
+                    if differences["different_bytes"] == 0:
+                        pending_events.append(("duplicates", {
+                            "algorithm": name,
+                            "files": [str(previous.path), str(path)], "digest": digest,
+                        }))
+                        break
+                else:
+                    if group:
+                        pending_events.append(("collisions", {
+                            "algorithm": name,
+                            "files": [str(group[0].path), str(path)], "digest": digest,
+                            "differences": first_differences,
+                        }))
+                    pending_groups.append((name, digest))
+            # Publish results only after every selected algorithm completed.
+            for name, digest in pending_groups:
+                seen[name].setdefault(digest, []).append(record)
+            for category, event in pending_events:
+                report[category].append(event)
             report["files_scanned"] += 1
         except (OSError, ValueError) as error:
             report["errors"].append({"file": str(path), "message": str(error)})
@@ -140,17 +174,29 @@ def scan(paths, algorithm="sha256"):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("files", nargs="+", type=Path)
-    parser.add_argument("--algorithm", choices=["md5", "sha1", "sha256"], default="sha256")
+    def algorithm_list(value):
+        try:
+            return normalize_algorithms(value)
+        except ValueError as error:
+            raise argparse.ArgumentTypeError(str(error)) from error
+
+    parser.add_argument(
+        "--algorithm", "--algorithms", action="append", type=algorithm_list,
+        metavar="NAME[,NAME...]",
+        help="Comma-separated hashes; may be repeated (default: sha256). "
+             "Available: " + ", ".join(SUPPORTED_ALGORITHMS),
+    )
     parser.add_argument("--json", action="store_true", help="Print a machine-readable report")
     args = parser.parse_args(argv)
-    report = scan(args.files, args.algorithm)
+    algorithms = [name for group in (args.algorithm or [["sha256"]]) for name in group]
+    report = scan(args.files, algorithms)
     if args.json:
         print(json.dumps(report, indent=2))
     else:
         for key, label in (("collisions", "COLLISION"), ("duplicates", "DUPLICATE")):
             for event in report[key]:
-                print(f"{label}: {event['files'][0]} and {event['files'][1]}")
-                print(f"  {args.algorithm}: {event['digest']}")
+                print(f"{label} [{event['algorithm']}]: {event['files'][0]} and {event['files'][1]}")
+                print(f"  {event['algorithm']}: {event['digest']}")
                 if key == "collisions":
                     differences = event["differences"]
                     print(f"  {differences['different_bytes']} differing bytes in "
@@ -162,6 +208,11 @@ def main(argv=None):
                         print(f"    Showing the first {MAX_DIFFERENCE_RANGES} ranges.")
         for error in report["errors"]:
             print(f"ERROR: {error['file']}: {error['message']}")
+        if len(report["algorithms"]) > 1:
+            for name in report["algorithms"]:
+                collisions = sum(event["algorithm"] == name for event in report["collisions"])
+                duplicates = sum(event["algorithm"] == name for event in report["duplicates"])
+                print(f"{name}: {collisions} collisions; {duplicates} duplicates.")
         print(f"Scanned {report['files_scanned']} files; "
               f"{len(report['collisions'])} collisions; "
               f"{len(report['duplicates'])} duplicates; "

@@ -5,9 +5,11 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from detect_collisions import (
-    CHUNK_SIZE, MAX_DIFFERENCE_RANGES, compare_files, hash_file, identical, scan,
+    CHUNK_SIZE, MAX_DIFFERENCE_RANGES, SUPPORTED_ALGORITHMS,
+    compare_files, hash_file, hash_file_many, identical, scan,
 )
 
 # Published MD5 collision example: https://www.mscs.dal.ca/~selinger/md5collision/
@@ -117,6 +119,78 @@ class DetectorTests(unittest.TestCase):
         self.assertEqual(report["files_scanned"], 2)
         self.assertEqual(report["collisions"], [])
         self.assertEqual(report["duplicates"], [])
+
+    def test_multiple_hashes_report_collision_only_for_md5(self):
+        a, b = self.write("a", FIRST), self.write("b", SECOND)
+        result = self.cli("--algorithms", "md5,sha1,sha256", "--json", a, b)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["algorithms"], ["md5", "sha1", "sha256"])
+        self.assertIsNone(report["algorithm"])
+        self.assertEqual(report["files_scanned"], 2)
+        self.assertEqual(len(report["collisions"]), 1)
+        self.assertEqual(report["collisions"][0]["algorithm"], "md5")
+        self.assertEqual(report["collisions"][0]["differences"]["different_bytes"], 6)
+        self.assertEqual(report["duplicates"], [])
+        self.assertEqual(report["errors"], [])
+
+    def test_all_supported_hashes_use_one_streaming_read(self):
+        content = b"hash multiple chunks" * (CHUNK_SIZE // 10)
+        path = self.write("large", content)
+        with patch.object(Path, "open", autospec=True, side_effect=Path.open) as opened:
+            digests, _ = hash_file_many(path, SUPPORTED_ALGORITHMS)
+        self.assertEqual(opened.call_count, 1)
+        self.assertEqual(set(digests), set(SUPPORTED_ALGORITHMS))
+        for name, digest in digests.items():
+            self.assertEqual(digest, hashlib.new(name, content, usedforsecurity=False).hexdigest())
+
+    def test_duplicates_are_per_algorithm_and_comparison_is_reused(self):
+        a, b = self.write("a", b"same content"), self.write("b", b"same content")
+        with patch("detect_collisions.compare_files", wraps=compare_files) as compared:
+            report = scan([a, b], ["md5", "sha1", "sha256"])
+        self.assertEqual(compared.call_count, 1)
+        self.assertEqual(report["files_scanned"], 2)
+        self.assertEqual([event["algorithm"] for event in report["duplicates"]],
+                         ["md5", "sha1", "sha256"])
+        self.assertEqual(report["collisions"], [])
+        self.assertEqual(report["errors"], [])
+
+    def test_repeated_flags_normalize_and_deduplicate_names(self):
+        a, b = self.write("a", FIRST), self.write("b", SECOND)
+        result = self.cli("--algorithm", "MD5, sha1", "--algorithm", "md5",
+                          "--json", a, b)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["algorithms"], ["md5", "sha1"])
+        self.assertEqual(len(report["collisions"]), 1)
+
+    def test_multi_hash_missing_input_is_reported_once_and_scan_continues(self):
+        a, b = self.write("a", FIRST), self.write("b", SECOND)
+        result = self.cli("--algorithms", "md5,sha1", "--json",
+                          a, self.root / "missing", b)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["files_scanned"], 2)
+        self.assertEqual(len(report["errors"]), 1)
+        self.assertEqual(len(report["collisions"]), 1)
+        self.assertEqual(report["collisions"][0]["algorithm"], "md5")
+
+    def test_invalid_algorithm_lists_fail_before_scanning(self):
+        for value in ["md5,unknown", "md5,", "", "shake_128"]:
+            with self.subTest(value=value):
+                result = self.cli("--algorithms", value, self.root / "missing")
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("Choose one or more algorithms", result.stderr)
+                self.assertEqual(result.stdout, "")
+
+    def test_multi_hash_text_output_has_separate_summaries(self):
+        a, b = self.write("a", FIRST), self.write("b", SECOND)
+        result = self.cli("--algorithms", "md5,sha1,sha256", a, b)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("COLLISION [md5]", result.stdout)
+        self.assertIn("md5: 1 collisions; 0 duplicates.", result.stdout)
+        self.assertIn("sha1: 0 collisions; 0 duplicates.", result.stdout)
+        self.assertIn("sha256: 0 collisions; 0 duplicates.", result.stdout)
 
     def test_duplicate_of_second_collision_variant(self):
         paths = [self.write(str(i), data) for i, data in enumerate([FIRST, SECOND, SECOND])]
