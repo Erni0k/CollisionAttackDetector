@@ -6,7 +6,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from detect_collisions import CHUNK_SIZE, hash_file, identical, scan
+from detect_collisions import (
+    CHUNK_SIZE, MAX_DIFFERENCE_RANGES, compare_files, hash_file, identical, scan,
+)
 
 # Published MD5 collision example: https://www.mscs.dal.ca/~selinger/md5collision/
 FIRST = bytes.fromhex("""
@@ -52,6 +54,60 @@ class DetectorTests(unittest.TestCase):
         self.assertEqual(len(report["collisions"]), 1)
         self.assertEqual(report["duplicates"], [])
         self.assertEqual(report["errors"], [])
+        differences = report["collisions"][0]["differences"]
+        self.assertEqual(differences["different_bytes"], 6)
+        self.assertEqual(differences["range_count"], 6)
+        self.assertEqual(differences["ranges"], [
+            {"start": position, "end": position + 1}
+            for position in [19, 45, 59, 83, 109, 123]
+        ])
+        self.assertFalse(differences["ranges_truncated"])
+
+    def differences(self, left, right):
+        _, a = hash_file(self.write("left", left), "sha256")
+        _, b = hash_file(self.write("right", right), "sha256")
+        return compare_files(a, b)
+
+    def test_difference_range_crosses_chunk_boundary(self):
+        left = b"a" * (CHUNK_SIZE * 2 + 3)
+        right = bytearray(left)
+        right[CHUNK_SIZE - 2:CHUNK_SIZE + 2] = b"bbbb"
+        result = self.differences(left, right)
+        self.assertEqual(result["different_bytes"], 4)
+        self.assertEqual(result["ranges"], [{"start": CHUNK_SIZE - 2, "end": CHUNK_SIZE + 2}])
+
+    def test_range_ends_at_start_of_identical_chunk(self):
+        result = self.differences(b"a" * (CHUNK_SIZE + 1), b"b" * CHUNK_SIZE + b"a")
+        self.assertEqual(result["different_bytes"], CHUNK_SIZE)
+        self.assertEqual(result["ranges"], [{"start": 0, "end": CHUNK_SIZE}])
+
+    def test_unequal_lengths_and_empty_file(self):
+        for left, right in [(b"abc", b"abcdef"), (b"abcdef", b"abc")]:
+            with self.subTest(left=left, right=right):
+                result = self.differences(left, right)
+                self.assertEqual(result["different_bytes"], 3)
+                self.assertEqual(result["ranges"], [{"start": 3, "end": 6}])
+        result = self.differences(b"", b"abc")
+        self.assertEqual(result["ranges"], [{"start": 0, "end": 3}])
+        result = self.differences(b"", b"")
+        self.assertEqual(result["different_bytes"], 0)
+        self.assertEqual(result["ranges"], [])
+
+    def test_difference_ranges_are_bounded_but_totals_are_exact(self):
+        count = MAX_DIFFERENCE_RANGES + 3
+        result = self.differences(b"aa" * count, b"ba" * count)
+        self.assertEqual(result["different_bytes"], count)
+        self.assertEqual(result["range_count"], count)
+        self.assertEqual(len(result["ranges"]), MAX_DIFFERENCE_RANGES)
+        self.assertTrue(result["ranges_truncated"])
+
+    def test_text_output_locates_known_collision_differences(self):
+        a, b = self.write("a", FIRST), self.write("b", SECOND)
+        result = self.cli("--algorithm", "md5", a, b)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("6 differing bytes in 6 ranges", result.stdout)
+        self.assertIn("bytes 19-19 (0x13-0x13)", result.stdout)
+        self.assertIn("bytes 123-123 (0x7b-0x7b)", result.stdout)
 
     def test_sha256_distinguishes_md5_collision_pair(self):
         a, b = self.write("a", FIRST), self.write("b", SECOND)

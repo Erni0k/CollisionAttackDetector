@@ -8,9 +8,11 @@ import os
 import stat
 from contextlib import ExitStack
 from dataclasses import dataclass
+from itertools import zip_longest
 from pathlib import Path
 
 CHUNK_SIZE = 1024 * 1024
+MAX_DIFFERENCE_RANGES = 20
 
 
 def signature(info):
@@ -43,8 +45,20 @@ def hash_file(path, algorithm):
     return digest.hexdigest(), record
 
 
-def identical(left, right):
-    """Compare bytes directly; another matching hash would not prove equality."""
+def compare_files(left, right):
+    """Summarize differing offsets, retaining a bounded number of byte ranges."""
+    ranges = []
+    range_count = 0
+    different_bytes = 0
+    run_start = None
+    offset = 0
+
+    def finish_range(start, end):
+        nonlocal range_count
+        range_count += 1
+        if len(ranges) < MAX_DIFFERENCE_RANGES:
+            ranges.append({"start": start, "end": end})
+
     with ExitStack() as stack:
         a = stack.enter_context(left.path.open("rb"))
         b = stack.enter_context(right.path.open("rb"))
@@ -52,15 +66,38 @@ def identical(left, right):
         check_unchanged(b, right)
         while True:
             chunk_a, chunk_b = a.read(CHUNK_SIZE), b.read(CHUNK_SIZE)
-            if chunk_a != chunk_b:
-                equal = False
+            if not chunk_a and not chunk_b:
                 break
-            if not chunk_a:
-                equal = True
-                break
+            if chunk_a == chunk_b:
+                if run_start is not None:
+                    finish_range(run_start, offset)
+                    run_start = None
+            else:
+                for index, (byte_a, byte_b) in enumerate(zip_longest(chunk_a, chunk_b)):
+                    position = offset + index
+                    if byte_a != byte_b:
+                        different_bytes += 1
+                        if run_start is None:
+                            run_start = position
+                    elif run_start is not None:
+                        finish_range(run_start, position)
+                        run_start = None
+            offset += max(len(chunk_a), len(chunk_b))
+        if run_start is not None:
+            finish_range(run_start, offset)
         check_unchanged(a, left)
         check_unchanged(b, right)
-        return equal
+    return {
+        "different_bytes": different_bytes,
+        "range_count": range_count,
+        "ranges": ranges,
+        "ranges_truncated": range_count > len(ranges),
+    }
+
+
+def identical(left, right):
+    """Compare bytes directly; another matching hash would not prove equality."""
+    return compare_files(left, right)["different_bytes"] == 0
 
 
 def scan(paths, algorithm="sha256"):
@@ -77,8 +114,12 @@ def scan(paths, algorithm="sha256"):
         try:
             digest, record = hash_file(path, algorithm)
             group = seen.setdefault(digest, [])
-            for previous in group:
-                if identical(previous, record):
+            first_differences = None
+            for index, previous in enumerate(group):
+                differences = compare_files(previous, record)
+                if index == 0:
+                    first_differences = differences
+                if differences["different_bytes"] == 0:
                     report["duplicates"].append({
                         "files": [str(previous.path), str(path)], "digest": digest,
                     })
@@ -87,6 +128,7 @@ def scan(paths, algorithm="sha256"):
                 if group:
                     report["collisions"].append({
                         "files": [str(group[0].path), str(path)], "digest": digest,
+                        "differences": first_differences,
                     })
                 group.append(record)
             report["files_scanned"] += 1
@@ -109,6 +151,15 @@ def main(argv=None):
             for event in report[key]:
                 print(f"{label}: {event['files'][0]} and {event['files'][1]}")
                 print(f"  {args.algorithm}: {event['digest']}")
+                if key == "collisions":
+                    differences = event["differences"]
+                    print(f"  {differences['different_bytes']} differing bytes in "
+                          f"{differences['range_count']} ranges (zero-based offsets):")
+                    for span in differences["ranges"]:
+                        start, last = span["start"], span["end"] - 1
+                        print(f"    bytes {start}-{last} (0x{start:x}-0x{last:x})")
+                    if differences["ranges_truncated"]:
+                        print(f"    Showing the first {MAX_DIFFERENCE_RANGES} ranges.")
         for error in report["errors"]:
             print(f"ERROR: {error['file']}: {error['message']}")
         print(f"Scanned {report['files_scanned']} files; "
